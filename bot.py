@@ -553,7 +553,61 @@ def handle_start_or_main_menu(chat_id, message_id=None):
 def handle_help(chat_id, message_id=None):
     """Допомога"""
     help_text = ("🐱 Котик-помічник тут!\n\n"
-                 "**Як користув=keyboard, parse_mode='Markdown')
+                 "**Як користуватися:**\n\n"
+                 "🔹 **Нагадування:** Натисни 'Додати нагадування' і котик проведе тебе крок за кроком\n"
+                 "🔹 **Дні народження:** Формат дати ММ-ДД (наприклад: 03-15 для 15 березня)\n"
+                 "🔹 **Розклад:** Переглядай свої нагадування на день/тиждень/місяць\n"
+                 "🔹 **Фото:** Надсилай фото розкладу і котик їх збереже\n"
+                 "🔹 **Природна мова:** Просто пиши котику природною мовою!\n\n"
+                 "**Приклади запитів природною мовою:**\n"
+                 "• \"котику, що у мене сьогодні?\"\n"
+                 "• \"покажи розклад на 15.03\"\n"
+                 "• \"які справи заплановані на завтра?\"\n"
+                 "• \"що у мене на понеділок?\"\n\n"
+                 "**Корисні команди:**\n"
+                 "/start - Головне меню\n"
+                 "/menu - Головне меню\n\n"
+                 "Мяу! Будь-які питання? Котик завжди готовий допомогти! 🐾")
+    
+    if message_id:
+        edit_message_text(chat_id, message_id, help_text, 
+                         reply_markup=get_back_to_main_keyboard(), parse_mode='Markdown')
+    else:
+        send_message(chat_id, help_text, 
+                    reply_markup=get_back_to_main_keyboard(), parse_mode='Markdown')
+
+def handle_list_reminders(chat_id, message_id=None):
+    """Список нагадувань"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM reminders WHERE chat_id=? AND is_active=1 ORDER BY hour, minute", (chat_id,))
+        reminders = cursor.fetchall()
+        conn.close()
+        
+        if not reminders:
+            text = "🐱 Мяу! У тебе немає активних нагадувань.\n\nКотик може допомогти створити нове!"
+            keyboard = {
+                'inline_keyboard': [
+                    [{'text': '➕ Додати нагадування', 'callback_data': 'add_reminder'}],
+                    [{'text': '🔙 Назад', 'callback_data': 'main_menu'}]
+                ]
+            }
+        else:
+            text = "🐱 **Котик знайшов твої нагадування:**\n\n"
+            for r in reminders:
+                days_emoji = get_days_emoji(r[5])
+                text += f"🔹 **ID {r[0]}:** {r[2]}\n"
+                text += f"⏰ {r[3]:02d}:{r[4]:02d} {days_emoji}\n"
+                text += f"📅 {r[5]}\n\n"
+            
+            text += "Для видалення надішли: /delete [ID]\nНаприклад: /delete 1"
+            keyboard = get_back_to_main_keyboard()
+        
+        if message_id:
+            edit_message_text(chat_id, message_id, text, reply_markup=keyboard, parse_mode='Markdown')
+        else:
+            send_message(chat_id, text, reply_markup=keyboard, parse_mode='Markdown')
             
     except Exception as e:
         logger.error(f"Помилка отримання списку нагадувань: {e}")
