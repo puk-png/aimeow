@@ -19,790 +19,7 @@ BASE_URL = f"https://api.telegram.org/bot{API_TOKEN}"
 # Глобальні змінні
 user_states = {}  # Зберігання станів користувачів
 user_data = {}    # Тимчасові дані користувачів
-reminders_thread = None
-stop_reminders = False
-
-# Стани FSM
-class States:
-    WAITING_FOR_TEXT = "waiting_for_text"
-    WAITING_FOR_TIME = "waiting_for_time"
-    WAITING_FOR_DAYS = "waiting_for_days"
-    WAITING_FOR_BIRTHDAY_NAME = "waiting_for_birthday_name"
-    WAITING_FOR_BIRTHDAY_DATE = "waiting_for_birthday_date"
-
-# --- База даних ---
-def init_db():
-    try:
-        conn = sqlite3.connect("reminders.db")
-        cursor = conn.cursor()
-        
-        # Таблиця нагадувань
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS reminders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            text TEXT,
-            hour INTEGER,
-            minute INTEGER,
-            days TEXT,
-            one_time INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_active INTEGER DEFAULT 1
-        )
-        """)
-        
-        # Таблиця фото розкладу
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS schedule_photos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            photo_file_id TEXT,
-            schedule_type TEXT,
-            description TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
-        
-        # Таблиця днів народження
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS birthdays (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            name TEXT,
-            birth_date TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
-        
-        conn.commit()
-        conn.close()
-        logger.info("✅ База даних ініціалізована")
-    except Exception as e:
-        logger.error(f"❌ Помилка ініціалізації БД: {e}")
-
-def get_db_connection():
-    return sqlite3.connect("reminders.db")
-
-# --- ШІ обробка природної мови ---
-class AIMessageProcessor:
-    """Клас для обробки повідомлень природною мовою"""
-    
-    def __init__(self):
-        self.date_patterns = [
-            r'(\d{1,2})\.(\d{1,2})\.?(\d{0,4})?',  # 01.01 або 01.01.2024
-            r'(\d{1,2})/(\d{1,2})/(\d{2,4})',      # 01/01/24
-            r'(\d{1,2})-(\d{1,2})-?(\d{0,4})?',    # 01-01 або 01-01-2024
-        ]
-        
-        self.time_patterns = [
-            r'(\d{1,2}):(\d{2})',                   # 14:30
-            r'(\d{1,2})\.(\d{2})',                  # 14.30
-            r'(\d{1,2}) год(?:ин[иа])?',            # 14 год
-        ]
-        
-        self.schedule_keywords = [
-            'розклад', 'schedule', 'заплановано', 'план', 'що у мене',
-            'нагадування', 'справи', 'діла', 'завдання'
-        ]
-        
-        self.today_keywords = [
-            'сьогодні', 'today', 'на сьогодні', 'цього дня'
-        ]
-        
-        self.tomorrow_keywords = [
-            'завтра', 'tomorrow', 'на завтра'
-        ]
-    
-    def extract_date(self, text):
-        """Витягує дату з тексту"""
-        for pattern in self.date_patterns:
-            match = re.search(pattern, text)
-            if match:
-                day, month = int(match.group(1)), int(match.group(2))
-                year = None
-                if match.group(3) and len(match.group(3)) > 0:
-                    year_str = match.group(3)
-                    if len(year_str) == 2:
-                        year = 2000 + int(year_str)
-                    else:
-                        year = int(year_str)
-                
-                try:
-                    if year:
-                        return datetime(year, month, day)
-                    else:
-                        # Якщо рік не вказано, використовуємо поточний або наступний
-                        current_year = datetime.now().year
-                        date = datetime(current_year, month, day)
-                        if date < datetime.now().replace(hour=0, minute=0, second=0, microsecond=0):
-                            date = datetime(current_year + 1, month, day)
-                        return date
-                except ValueError:
-                    continue
-        return None
-    
-    def extract_time(self, text):
-        """Витягує час з тексту"""
-        for pattern in self.time_patterns:
-            match = re.search(pattern, text)
-            if match:
-                hour = int(match.group(1))
-                minute = int(match.group(2)) if len(match.groups()) > 1 else 0
-                if 0 <= hour <= 23 and 0 <= minute <= 59:
-                    return hour, minute
-        return None
-    
-    def is_schedule_request(self, text):
-        """Перевіряє, чи є це запит на розклад"""
-        text_lower = text.lower()
-        return any(keyword in text_lower for keyword in self.schedule_keywords)
-    
-    def get_date_context(self, text):
-        """Визначає контекст дати (сьогодні, завтра, конкретна дата)"""
-        text_lower = text.lower()
-        
-        if any(keyword in text_lower for keyword in self.today_keywords):
-            return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        if any(keyword in text_lower for keyword in self.tomorrow_keywords):
-            return (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        # Спробуємо витягти конкретну дату
-        return self.extract_date(text)
-    
-    def process_natural_message(self, text, chat_id):
-        """Основна функція обробки природного повідомлення"""
-        if not self.is_schedule_request(text):
-            return None
-        
-        target_date = self.get_date_context(text)
-        
-        if target_date:
-            return self.get_schedule_for_date(chat_id, target_date)
-        else:
-            # Якщо дата не визначена, показуємо загальний розклад
-            return self.get_general_schedule(chat_id)
-    
-    def get_schedule_for_date(self, chat_id, target_date):
-        """Отримує розклад на конкретну дату"""
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            # Визначаємо день тижня
-            day_name = calendar.day_name[target_date.weekday()].lower()[:3]
-            
-            # Отримуємо нагадування на цей день
-            cursor.execute("""
-                SELECT * FROM reminders 
-                WHERE chat_id=? AND is_active=1 
-                AND (days LIKE ? OR days LIKE ?)
-                ORDER BY hour, minute
-            """, (chat_id, f'%{day_name}%', '%mon,tue,wed,thu,fri,sat,sun%'))
-            
-            reminders = cursor.fetchall()
-            
-            # Отримуємо дні народження на цю дату
-            date_str = f"{target_date.month:02d}-{target_date.day:02d}"
-            cursor.execute("""
-                SELECT * FROM birthdays 
-                WHERE chat_id=? AND birth_date=?
-            """, (chat_id, date_str))
-            
-            birthdays = cursor.fetchall()
-            
-            conn.close()
-            
-            # Формуємо відповідь
-            date_formatted = target_date.strftime('%d.%m.%Y')
-            day_name_uk = self.get_day_name_ukrainian(target_date.weekday())
-            
-            response = f"📅 Котик знайшов розклад на {date_formatted} ({day_name_uk}):\n\n"
-            
-            if reminders:
-                response += "🔔 **Нагадування:**\n"
-                for r in reminders:
-                    response += f"⏰ {r[3]:02d}:{r[4]:02d} - {r[2]}\n"
-                response += "\n"
-            
-            if birthdays:
-                response += "🎂 **Дні народження:**\n"
-                for b in birthdays:
-                    response += f"🎉 {b[2]}\n"
-                response += "\n"
-            
-            if not reminders and not birthdays:
-                response += "🐱 Мяу! На цей день немає запланованих подій.\nКотик може допомогти додати щось нове!"
-            
-            return response
-            
-        except Exception as e:
-            logger.error(f"Помилка отримання розкладу: {e}")
-            return "❌ Котик спіткнувся при пошуку розкладу."
-    
-    def get_general_schedule(self, chat_id):
-        """Отримує загальний розклад"""
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT * FROM reminders 
-                WHERE chat_id=? AND is_active=1
-                ORDER BY hour, minute
-                LIMIT 10
-            """, (chat_id,))
-            
-            reminders = cursor.fetchall()
-            conn.close()
-            
-            if not reminders:
-                return "🐱 Мяу! У тебе немає активних нагадувань.\nКотик може допомогти створити нове!"
-            
-            response = "📋 **Котик знайшов твої нагадування:**\n\n"
-            for r in reminders:
-                days_emoji = get_days_emoji(r[5])
-                response += f"⏰ {r[3]:02d}:{r[4]:02d} - {r[2]}\n"
-                response += f"📅 {r[5]} {days_emoji}\n\n"
-            
-            return response
-            
-        except Exception as e:
-            logger.error(f"Помилка отримання загального розкладу: {e}")
-            return "❌ Котик спіткнувся при пошуку розкладу."
-    
-    def get_day_name_ukrainian(self, weekday):
-        """Повертає назву дня тижня українською"""
-        days = ['понеділок', 'вівторок', 'середа', 'четвер', "п'ятниця", 'субота', 'неділя']
-        return days[weekday]
-
-# Ініціалізуємо AI процесор
-ai_processor = AIMessageProcessor()
-
-# --- Telegram API функції ---
-def send_message(chat_id, text, reply_markup=None, parse_mode=None):
-    """Надсилання повідомлення"""
-    try:
-        # Обмежуємо довжину повідомлення
-        if len(text) > 4096:
-            text = text[:4093] + "..."
-        
-        data = {
-            'chat_id': chat_id,
-            'text': text
-        }
-        if reply_markup:
-            data['reply_markup'] = json.dumps(reply_markup)
-        if parse_mode:
-            data['parse_mode'] = parse_mode
-            
-        response = requests.post(f"{BASE_URL}/sendMessage", data=data, timeout=10)
-        return response.json()
-    except Exception as e:
-        logger.error(f"Помилка надсилання повідомлення: {e}")
-        return None
-
-def send_photo(chat_id, photo_file_id, caption=None, reply_markup=None):
-    """Надсилання фото"""
-    try:
-        data = {
-            'chat_id': chat_id,
-            'photo': photo_file_id
-        }
-        if caption:
-            data['caption'] = caption[:1024]  # Обмеження для caption
-        if reply_markup:
-            data['reply_markup'] = json.dumps(reply_markup)
-            
-        response = requests.post(f"{BASE_URL}/sendPhoto", data=data, timeout=10)
-        return response.json()
-    except Exception as e:
-        logger.error(f"Помилка надсилання фото: {e}")
-        return None
-
-def edit_message_text(chat_id, message_id, text, reply_markup=None):
-    """Редагування повідомлення"""
-    try:
-        if len(text) > 4096:
-            text = text[:4093] + "..."
-            
-        data = {
-            'chat_id': chat_id,
-            'message_id': message_id,
-            'text': text
-        }
-        if reply_markup:
-            data['reply_markup'] = json.dumps(reply_markup)
-            
-        response = requests.post(f"{BASE_URL}/editMessageText", data=data, timeout=10)
-        return response.json()
-    except Exception as e:
-        logger.error(f"Помилка редагування повідомлення: {e}")
-        return None
-
-def answer_callback_query(callback_query_id, text=None):
-    """Відповідь на callback query"""
-    try:
-        data = {'callback_query_id': callback_query_id}
-        if text:
-            data['text'] = text
-        response = requests.post(f"{BASE_URL}/answerCallbackQuery", data=data, timeout=10)
-        return response.json()
-    except Exception as e:
-        logger.error(f"Помилка відповіді на callback: {e}")
-        return None
-
-# --- Клавіатури з кнопками ---
-def get_main_menu_keyboard():
-    return {
-        'inline_keyboard': [
-            [{'text': '➕ Додати нагадування', 'callback_data': 'add_reminder'}],
-            [{'text': '📝 Мої нагадування', 'callback_data': 'list_reminders'}],
-            [{'text': '🎂 Дні народження', 'callback_data': 'birthdays_menu'}],
-            [{'text': '📅 Розклад', 'callback_data': 'schedule_menu'}],
-            [{'text': '📸 Фото розкладу', 'callback_data': 'photos_menu'}],
-            [{'text': 'ℹ️ Допомога', 'callback_data': 'help'}]
-        ]
-    }
-
-def get_schedule_keyboard():
-    return {
-        'inline_keyboard': [
-            [{'text': '📅 Сьогодні', 'callback_data': 'schedule_today'},
-             {'text': '📆 Завтра', 'callback_data': 'schedule_tomorrow'}],
-            [{'text': '🗓️ Цей тиждень', 'callback_data': 'schedule_week'},
-             {'text': '📊 Цей місяць', 'callback_data': 'schedule_month'}],
-            [{'text': '🔙 Назад', 'callback_data': 'main_menu'}]
-        ]
-    }
-
-def get_days_keyboard():
-    return {
-        'inline_keyboard': [
-            [{'text': 'Будні', 'callback_data': 'days_weekdays'},
-             {'text': 'Вихідні', 'callback_data': 'days_weekend'}],
-            [{'text': 'Щодня', 'callback_data': 'days_daily'}],
-            [{'text': '❌ Скасувати', 'callback_data': 'cancel_reminder'}]
-        ]
-    }
-
-def get_birthday_keyboard():
-    return {
-        'inline_keyboard': [
-            [{'text': '➕ Додати день народження', 'callback_data': 'add_birthday'}],
-            [{'text': '📝 Мої дні народження', 'callback_data': 'list_birthdays'}],
-            [{'text': '🗑️ Видалити день народження', 'callback_data': 'delete_birthday_menu'}],
-            [{'text': '🔙 Назад', 'callback_data': 'main_menu'}]
-        ]
-    }
-
-def get_photos_keyboard():
-    return {
-        'inline_keyboard': [
-            [{'text': '📋 Переглянути фото', 'callback_data': 'view_photos'}],
-            [{'text': '➕ Додати фото', 'callback_data': 'add_photo_info'}],
-            [{'text': '🔙 Назад', 'callback_data': 'main_menu'}]
-        ]
-    }
-
-def get_cancel_keyboard():
-    return {
-        'inline_keyboard': [
-            [{'text': '❌ Скасувати', 'callback_data': 'main_menu'}]
-        ]
-    }
-
-def get_back_to_main_keyboard():
-    return {
-        'inline_keyboard': [
-            [{'text': '🔙 Головне меню', 'callback_data': 'main_menu'}]
-        ]
-    }
-
-# --- Допоміжні функції ---
-def get_days_emoji(days_str):
-    days_map = {
-        'mon': '🟢', 'tue': '🟡', 'wed': '🔵', 'thu': '🟠', 
-        'fri': '🔴', 'sat': '🟣', 'sun': '⚪'
-    }
-    if not days_str:
-        return ""
-    
-    days_list = [d.strip().lower() for d in days_str.split(',')]
-    return ' '.join([days_map.get(day, '⚫') for day in days_list])
-
-def set_user_state(user_id, state):
-    user_states[user_id] = state
-
-def get_user_state(user_id):
-    return user_states.get(user_id)
-
-def clear_user_state(user_id):
-    user_states.pop(user_id, None)
-    user_data.pop(user_id, None)
-
-def set_user_data(user_id, key, value):
-    if user_id not in user_data:
-        user_data[user_id] = {}
-    user_data[user_id][key] = value
-
-def get_user_data(user_id, key=None):
-    if key:
-        return user_data.get(user_id, {}).get(key)
-    return user_data.get(user_id, {})
-
-# --- Система нагадувань ---
-def check_reminders():
-    """Перевірка нагадувань кожну хвилину"""
-    global stop_reminders
-    
-    while not stop_reminders:
-        try:
-            now = datetime.now()
-            current_hour = now.hour
-            current_minute = now.minute
-            current_day = calendar.day_name[now.weekday()].lower()[:3]
-            
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            # Перевірка звичайних нагадувань
-            cursor.execute("""
-                SELECT * FROM reminders 
-                WHERE is_active=1 AND hour=? AND minute=? 
-                AND (days LIKE ? OR days LIKE ?)
-            """, (current_hour, current_minute, f'%{current_day}%', '%mon,tue,wed,thu,fri,sat,sun%'))
-            
-            reminders = cursor.fetchall()
-            
-            for reminder in reminders:
-                reminder_id, chat_id, text = reminder[0], reminder[1], reminder[2]
-                send_message(chat_id, f"🔔 Мяу! Нагадування:\n{text}", 
-                           reply_markup=get_back_to_main_keyboard())
-                logger.info(f"✅ Відправлено нагадування {reminder_id}")
-                
-                # Якщо однократне нагадування, видаляємо
-                if len(reminder) > 6 and reminder[6] == 1:  # one_time
-                    cursor.execute("DELETE FROM reminders WHERE id=?", (reminder_id,))
-            
-            # Перевірка днів народження (тільки о 00:00)
-            if current_hour == 0 and current_minute == 0:
-                current_month = now.month
-                current_day_num = now.day
-                
-                cursor.execute("""
-                    SELECT * FROM birthdays 
-                    WHERE birth_date = ?
-                """, (f"{current_month:02d}-{current_day_num:02d}",))
-                
-                birthdays = cursor.fetchall()
-                
-                for birthday in birthdays:
-                    chat_id, name = birthday[1], birthday[2]
-                    message = f"🎂 Мяу! Сьогодні день народження!\n\n" \
-                              f"🎉 {name}\n" \
-                              f"📅 {current_day_num:02d}.{current_month:02d}\n\n" \
-                              f"Котик нагадує: не забудь привітати! 🎁"
-                    
-                    send_message(chat_id, message, reply_markup=get_back_to_main_keyboard())
-                    logger.info(f"✅ Відправлено привітання з днем народження: {name}")
-            
-            conn.commit()
-            conn.close()
-            
-        except Exception as e:
-            logger.error(f"Помилка перевірки нагадувань: {e}")
-            try:
-                if 'conn' in locals():
-                    conn.close()
-            except:
-                pass
-        
-        # Спочивати 60 секунд
-        time.sleep(60)
-
-def start_reminder_thread():
-    """Запуск потоку для перевірки нагадувань"""
-    global reminders_thread
-    if reminders_thread is None or not reminders_thread.is_alive():
-        reminders_thread = threading.Thread(target=check_reminders, daemon=True)
-        reminders_thread.start()
-        logger.info("✅ Потік нагадувань запущено")
-
-# --- Обробники команд ---
-def handle_start_or_main_menu(chat_id, message_id=None):
-    """Головне меню"""
-    text = ("🐱 Мяу! Привіт! Я котик-нагадувач!\n\n"
-            "Що я можу:\n"
-            "➕ Створювати нагадування\n"
-            "🎂 Нагадувати про дні народження\n" 
-            "📅 Показувати розклад\n"
-            "📸 Зберігати фото розкладу\n"
-            "🤖 Розуміти природну мову!\n\n"
-            "**Приклади запитів:**\n"
-            "• \"котику, який у мене розклад на завтра?\"\n"
-            "• \"що заплановано на 01.01?\"\n"
-            "• \"покажи мої справи на сьогодні\"\n\n"
-            "Котик готовий допомогти! Обирай що потрібно:")
-    
-    if message_id:
-        edit_message_text(chat_id, message_id, text, reply_markup=get_main_menu_keyboard())
-    else:
-        send_message(chat_id, text, reply_markup=get_main_menu_keyboard(), parse_mode='Markdown')
-
-def handle_help(chat_id, message_id=None):
-    """Допомога"""
-    help_text = ("🐱 Котик-помічник тут!\n\n"
-                 "**Як користуватися:**\n\n"
-                 "🔹 **Нагадування:** Натисни 'Додати нагадування' і котик проведе тебе крок за кроком\n"
-                 "🔹 **Дні народження:** Формат дати ММ-ДД (наприклад: 03-15 для 15 березня)\n"
-                 "🔹 **Розклад:** Переглядай свої нагадування на день/тиждень/місяць\n"
-                 "🔹 **Фото:** Надсилай фото розкладу і котик їх збереже\n"
-                 "🔹 **Природна мова:** Просто пиши котику природною мовою!\n\n"
-                 "**Приклади запитів природною мовою:**\n"
-                 "• \"котику, що у мене сьогодні?\"\n"
-                 "• \"покажи розклад на 15.03\"\n"
-                 "• \"які справи заплановані на завтра?\"\n"
-                 "• \"що у мене на понеділок?\"\n\n"
-                 "**Корисні команди:**\n"
-                 "/start - Головне меню\n"
-                 "/menu - Головне меню\n\n"
-                 "Мяу! Будь-які питання? Котик завжди готовий допомогти! 🐾")
-    
-    if message_id:
-        edit_message_text(chat_id, message_id, help_text, 
-                         reply_markup=get_back_to_main_keyboard(), parse_mode='Markdown')
-    else:
-        send_message(chat_id, help_text, 
-                    reply_markup=get_back_to_main_keyboard(), parse_mode='Markdown')
-
-def handle_list_reminders(chat_id, message_id=None):
-    """Список нагадувань"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM reminders WHERE chat_id=? AND is_active=1 ORDER BY hour, minute", (chat_id,))
-        reminders = cursor.fetchall()
-        conn.close()
-        
-        if not reminders:
-            text = "🐱 Мяу! У тебе немає активних нагадувань.\n\nКотик може допомогти створити нове!"
-            keyboard = {
-                'inline_keyboard': [
-                    [{'text': '➕ Додати нагадування', 'callback_data': 'add_reminder'}],
-                    [{'text': '🔙 Назад', 'callback_data': 'main_menu'}]
-                ]
-            }
-        else:
-            text = "🐱 **Котик знайшов твої нагадування:**\n\n"
-            for r in reminders:
-                days_emoji = get_days_emoji(r[5])
-                text += f"🔹 **ID {r[0]}:** {r[2]}\n"
-                text += f"⏰ {r[3]:02d}:{r[4]:02d} {days_emoji}\n"
-                text += f"📅 {r[5]}\n\n"
-            
-            text += "Для видалення надішли: /delete [ID]\nНаприклад: /delete 1"
-            keyboard = get_back_to_main_keyboard()
-        
-        if message_id:
-            edit_message_text(chat_id, message_id, text, reply_markup=keyboard, parse_mode='Markdown')
-        else:
-            send_message(chat_id, text, reply_markup=keyboard, parse_mode='Markdown')
-            
-    except Exception as e:
-        logger.error(f"Помилка отримання списку нагадувань: {e}")
-        error_text = "❌ Котик спіткнувся при отриманні списку нагадувань."
-        if message_id:
-            edit_message_text(chat_id, message_id, error_text, reply_markup=get_back_to_main_keyboard())
-        else:
-            send_message(chat_id, error_text, reply_markup=get_back_to_main_keyboard())
-
-def handle_list_birthdays(chat_id, message_id=None):
-    """Список днів народження"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM birthdays WHERE chat_id=? ORDER BY name", (chat_id,))
-        birthdays = cursor.fetchall()
-        conn.close()
-        
-        if not birthdays:
-            text = "🐱 Мяу! У тебе немає збережених днів народження.\n\nКотик може допомогти додати!"
-            keyboard = {
-                'inline_keyboard': [
-                    [{'text': '➕ Додати день народження', 'callback_data': 'add_birthday'}],
-                    [{'text': '🔙 Назад', 'callback_data': 'birthdays_menu'}]
-                ]
-            }
-        else:
-            text = "🎂 **Котик знайшов дні народження:**\n\n"
-            for b in birthdays:
-                birthday_id, _, name, birth_date = b[:4]
-                month, day = map(int, birth_date.split('-'))
-                text += f"🔹 **{name}** (ID: {birthday_id})\n"
-                text += f"📅 {day:02d}.{month:02d}\n\n"
-            
-            text += "Для видалення надішли: /delete_birthday [ID]\nНаприклад: /delete_birthday 1"
-            keyboard = {
-                'inline_keyboard': [
-                    [{'text': '🔙 Назад', 'callback_data': 'birthdays_menu'}]
-                ]
-            }
-        
-        if message_id:
-            edit_message_text(chat_id, message_id, text, reply_markup=keyboard, parse_mode='Markdown')
-        else:
-            send_message(chat_id, text, reply_markup=keyboard, parse_mode='Markdown')
-            
-    except Exception as e:
-        logger.error(f"Помилка отримання списку днів народження: {e}")
-        error_text = "❌ Котик спіткнувся при отриманні списку днів народження."
-        if message_id:
-            edit_message_text(chat_id, message_id, error_text, reply_markup=get_back_to_main_keyboard())
-        else:
-            send_message(chat_id, error_text, reply_markup=get_back_to_main_keyboard())
-
-def handle_view_photos(chat_id, message_id=None):
-    """Перегляд фото"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT * FROM schedule_photos 
-            WHERE chat_id=? 
-            ORDER BY created_at DESC 
-            LIMIT 10
-        """, (chat_id,))
-        photos = cursor.fetchall()
-        conn.close()
-        
-        if not photos:
-            text = "🐱 Мяу! У тебе немає збережених фото розкладу.\n\nКотик може допомогти додати!"
-            keyboard = {
-                'inline_keyboard': [
-                    [{'text': '➕ Додати фото', 'callback_data': 'add_photo_info'}],
-                    [{'text': '🔙 Назад', 'callback_data': 'photos_menu'}]
-                ]
-            }
-            
-            if message_id:
-                edit_message_text(chat_id, message_id, text, reply_markup=keyboard)
-            else:
-                send_message(chat_id, text, reply_markup=keyboard)
-        else:
-            if message_id:
-                edit_message_text(chat_id, message_id, 
-                                 f"🐱 Котик знайшов {len(photos)} фото розкладу:", 
-                                 reply_markup=get_back_to_main_keyboard())
-            else:
-                send_message(chat_id, f"🐱 Котик знайшов {len(photos)} фото розкладу:", 
-                            reply_markup=get_back_to_main_keyboard())
-            
-            for photo in photos:
-                caption = f"📅 {photo[4]} (ID: {photo[0]})\n📆 {photo[6] if len(photo) > 6 else 'Дата не вказана'}"
-                send_photo(chat_id, photo[2], caption=caption)
-                
-    except Exception as e:
-        logger.error(f"Помилка перегляду фото: {e}")
-        error_text = "❌ Котик спіткнувся при перегляді фото."
-        if message_id:
-            edit_message_text(chat_id, message_id, error_text, reply_markup=get_back_to_main_keyboard())
-        else:
-            send_message(chat_id, error_text, reply_markup=get_back_to_main_keyboard())
-
-# --- Обробка станів FSM ---
-def handle_state_message(message):
-    user_id = message['from']['id']
-    chat_id = message['chat']['id']
-    state = get_user_state(user_id)
-    
-    try:
-        if state == States.WAITING_FOR_TEXT:
-            set_user_data(user_id, 'text', message['text'])
-            set_user_state(user_id, States.WAITING_FOR_TIME)
-            send_message(chat_id, "🐱 Мяу! Котик записав текст.\n\n⏰ Тепер введи час у форматі ГГ:ХХ (наприклад, 14:30):", 
-                        reply_markup=get_cancel_keyboard())
-            
-        elif state == States.WAITING_FOR_TIME:
-            try:
-                time_parts = message['text'].replace('.', ':').split(":")
-                if len(time_parts) != 2:
-                    raise ValueError
-                    
-                hour, minute = map(int, time_parts)
-                if not (0 <= hour <= 23 and 0 <= minute <= 59):
-                    raise ValueError
-                
-                set_user_data(user_id, 'hour', hour)
-                set_user_data(user_id, 'minute', minute)
-                set_user_state(user_id, States.WAITING_FOR_DAYS)
-                send_message(chat_id, "🐱 Відмінно! Котик запам'ятав час.\n\n📅 Тепер обери дні для нагадування:", 
-                            reply_markup=get_days_keyboard())
-            except:
-                send_message(chat_id, "🐱 Мяу! Котик не розуміє такий час.\n\n❌ Введи у форматі ГГ:ХХ (наприклад, 09:30):", 
-                            reply_markup=get_cancel_keyboard())
-                
-        elif state == States.WAITING_FOR_BIRTHDAY_NAME:
-            if len(message['text'].strip()) == 0:
-                send_message(chat_id, "🐱 Мяу! Ім'я не може бути пустим.\n\n📝 Введи ім'я людини:", 
-                            reply_markup=get_cancel_keyboard())
-                return
-                
-            set_user_data(user_id, 'birthday_name', message['text'].strip())
-            set_user_state(user_id, States.WAITING_FOR_BIRTHDAY_DATE)
-            send_message(chat_id, f"🐱 Котик запам'ятав ім'я: {message['text']}\n\n📅 Тепер введи дату народження у форматі ММ-ДД\n(наприклад: 03-15 для 15 березня):", 
-                        reply_markup=get_cancel_keyboard())
-            
-        elif state == States.WAITING_FOR_BIRTHDAY_DATE:
-            try:
-                date_text = message['text'].replace('.', '-').replace('/', '-')
-                date_parts = date_text.split('-')
-                if len(date_parts) != 2:
-                    raise ValueError
-                
-                month, day = map(int, date_parts)
-                if not (1 <= month <= 12 and 1 <= day <= 31):
-                    raise ValueError
-                
-                # Перевірка на коректність дати
-                try:
-                    datetime(2024, month, day)  # Перевіряємо в високосний рік
-                except ValueError:
-                    raise ValueError("Неправильна дата")
-                
-                name = get_user_data(user_id, 'birthday_name')
-                birth_date = f"{month:02d}-{day:02d}"
-                
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO birthdays (chat_id, name, birth_date) VALUES (?, ?, ?)",
-                    (chat_id, name, birth_date)
-                )
-                conn.commit()
-                conn.close()
-                
-                clear_user_state(user_id)
-                send_message(chat_id, 
-                    f"✅ Мяу! Котик додав день народження!\n\n"
-                    f"🎂 Ім'я: {name}\n"
-                    f"📅 Дата: {day:02d}.{month:02d}\n\n"
-                    f"🐱 Котик буде нагадувати щороку о 00:00! 🎉",
-                    reply_markup=get_back_to_main_keyboard())
-                    
-            except:
-                send_message(chat_id, 
-                    "🐱 Мяу! Котик не розуміє таку дату.\n\n"
-                    "❌ Введи у форматі ММ-ДД (наприклад: 03-15 для 15 березня):", 
-                    reply_markup=get_cancel_keyboard())
-                    
-    except Exception as e:
-        logger.error(f"Помилка обробки стану {state}: {e}")
-        clear_user_state(user_id)
-        send_message(chat_id, "❌ Котик спіткнувся. Спробуй ще раз з головного меню.", 
-                    reply_markup=get_main_menu_keyboard())
-
-# --- Обробка callback запитів ---
+reminders_thread = # --- Обробка callback запитів ---
 def handle_callback_query(callback_query):
     try:
         chat_id = callback_query['message']['chat']['id']
@@ -826,22 +43,38 @@ def handle_callback_query(callback_query):
                              "🐱 Котик готовий допомогти!\n\n📝 Введи текст нагадування:", 
                              reply_markup=get_cancel_keyboard())
         
-        # Скасування нагадування
-        elif data == 'cancel_reminder':
-            clear_user_state(user_id)
+        # Вибір типу нагадування
+        elif data == 'reminder_type_recurring':
+            set_user_data(user_id, 'reminder_type', 'recurring')
+            set_user_state(user_id, States.WAITING_FOR_TIME)
             edit_message_text(chat_id, message_id, 
-                             "🐱 Мяу! Котик скасував створення нагадування.", 
-                             reply_markup=get_back_to_main_keyboard())
+                             "🔁 Регулярне нагадування\n\n⏰ Введи час у форматі ГГ:ХХ (наприклад, 14:30):", 
+                             reply_markup=get_cancel_keyboard())
+        
+        elif data == 'reminder_type_onetime':
+            set_user_data(user_id, 'reminder_type', 'one_time')
+            set_user_state(user_id, States.WAITING_FOR_TIME)
+            edit_message_text(chat_id, message_id, 
+                             "📌 Одноразове нагадування\n\n⏰ Введи час у форматі ГГ:ХХ (наприклад, 14:30):", 
+                             reply_markup=get_cancel_keyboard())
         
         # Список нагадувань
         elif data == 'list_reminders':
             handle_list_reminders(chat_id, message_id)
         
-        # Дні нагадування
+        # Дні нагадування для регулярних
         elif data.startswith('days_'):
             state = get_user_state(user_id)
             if state == States.WAITING_FOR_DAYS:
                 user_data_dict = get_user_data(user_id)
+                
+                if data == 'days_custom':
+                    # Вибіркові дні - показуємо клавіатуру з днями тижня
+                    set_user_data(user_id, 'selected_days', [])
+                    edit_message_text(chat_id, message_id,
+                        "🐱 Обери дні тижня для нагадування:\n(Можна вибрати кілька)",
+                        reply_markup=get_weekdays_keyboard())
+                    return
                 
                 days_map = {
                     'days_weekdays': ('mon,tue,wed,thu,fri', 'Будні'),
@@ -855,23 +88,93 @@ def handle_callback_query(callback_query):
                     conn = get_db_connection()
                     cursor = conn.cursor()
                     cursor.execute(
-                        "INSERT INTO reminders (chat_id,text,hour,minute,days,one_time) VALUES (?,?,?,?,?,?)",
+                        """INSERT INTO reminders (chat_id, text, hour, minute, days, one_time, reminder_type) 
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
                         (chat_id, user_data_dict['text'], user_data_dict['hour'], 
-                         user_data_dict['minute'], days, 0)
+                         user_data_dict['minute'], days, 0, 'recurring')
                     )
                     conn.commit()
                     conn.close()
                     
                     edit_message_text(chat_id, message_id,
-                        f"✅ Мяу! Котик створив нагадування!\n\n"
+                        f"✅ Котик створив регулярне нагадування!\n\n"
                         f"📝 Текст: {user_data_dict['text']}\n"
                         f"⏰ Час: {user_data_dict['hour']:02d}:{user_data_dict['minute']:02d}\n"
                         f"📅 Дні: {days_text} {get_days_emoji(days)}\n\n"
-                        f"🐱 Котик буде нагадувати! 🔔",
+                        f"🐱 Котик буде нагадувати! 🔁",
                         reply_markup=get_back_to_main_keyboard()
                     )
                     
                     clear_user_state(user_id)
+        
+        # Вибір окремих днів тижня
+        elif data.startswith('day_'):
+            state = get_user_state(user_id)
+            if state == States.WAITING_FOR_DAYS:
+                day = data.split('_')[1]
+                selected_days = get_user_data(user_id, 'selected_days') or []
+                
+                if day in selected_days:
+                    selected_days.remove(day)
+                else:
+                    selected_days.append(day)
+                
+                set_user_data(user_id, 'selected_days', selected_days)
+                
+                # Оновлюємо клавіатуру, щоб показати вибрані дні
+                keyboard = get_weekdays_keyboard()
+                for row in keyboard['inline_keyboard']:
+                    for button in row:
+                        if button['callback_data'].startswith('day_'):
+                            button_day = button['callback_data'].split('_')[1]
+                            if button_day in selected_days:
+                                button['text'] = '✅ ' + button['text']
+                
+                selected_text = "Вибрані дні: " + ', '.join(selected_days) if selected_days else "Дні не вибрані"
+                
+                edit_message_text(chat_id, message_id,
+                    f"🐱 Обери дні тижня для нагадування:\n\n{selected_text}",
+                    reply_markup=keyboard)
+        
+        # Завершення вибору днів
+        elif data == 'days_selected':
+            state = get_user_state(user_id)
+            if state == States.WAITING_FOR_DAYS:
+                selected_days = get_user_data(user_id, 'selected_days') or []
+                
+                if not selected_days:
+                    edit_message_text(chat_id, message_id,
+                        "🐱 Потрібно вибрати хоча б один день!\n\nОбери дні тижня:",
+                        reply_markup=get_weekdays_keyboard())
+                    return
+                
+                user_data_dict = get_user_data(user_id)
+                days_string = ','.join(selected_days)
+                
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    """INSERT INTO reminders (chat_id, text, hour, minute, days, one_time, reminder_type) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (chat_id, user_data_dict['text'], user_data_dict['hour'], 
+                     user_data_dict['minute'], days_string, 0, 'recurring')
+                )
+                conn.commit()
+                conn.close()
+                
+                days_names = {'mon': 'Пн', 'tue': 'Вт', 'wed': 'Ср', 'thu': 'Чт', 'fri': 'Пт', 'sat': 'Сб', 'sun': 'Нд'}
+                days_text = ', '.join([days_names.get(day, day) for day in selected_days])
+                
+                edit_message_text(chat_id, message_id,
+                    f"✅ Котик створив регулярне нагадування!\n\n"
+                    f"📝 Текст: {user_data_dict['text']}\n"
+                    f"⏰ Час: {user_data_dict['hour']:02d}:{user_data_dict['minute']:02d}\n"
+                    f"📅 Дні: {days_text} {get_days_emoji(days_string)}\n\n"
+                    f"🐱 Котик буде нагадувати! 🔁",
+                    reply_markup=get_back_to_main_keyboard()
+                )
+                
+                clear_user_state(user_id)
         
         # Меню днів народження
         elif data == 'birthdays_menu':
@@ -907,44 +210,77 @@ def handle_callback_query(callback_query):
             
             if period == 'today':
                 day_name = calendar.day_name[now.weekday()].lower()[:3]
+                today_str = now.strftime('%Y-%m-%d')
+                
+                # Регулярні нагадування
                 cursor.execute("""
                     SELECT * FROM reminders 
-                    WHERE chat_id=? AND is_active=1 AND (days LIKE ? OR days LIKE ?)
+                    WHERE chat_id=? AND is_active=1 AND reminder_type='recurring'
+                    AND (days LIKE ? OR days LIKE ?)
                     ORDER BY hour, minute
                 """, (chat_id, f'%{day_name}%', '%mon,tue,wed,thu,fri,sat,sun%'))
-                title = f"📅 Котик знайшов розклад на сьогодні ({now.strftime('%d.%m.%Y')})"
+                recurring = cursor.fetchall()
+                
+                # Одноразові на сьогодні
+                cursor.execute("""
+                    SELECT * FROM reminders 
+                    WHERE chat_id=? AND is_active=1 AND reminder_type='one_time'
+                    AND specific_date=?
+                    ORDER BY hour, minute
+                """, (chat_id, today_str))
+                onetime = cursor.fetchall()
+                
+                title = f"📅 Розклад на сьогодні ({now.strftime('%d.%m.%Y')})"
                 
             elif period == 'tomorrow':
                 tomorrow = now + timedelta(days=1)
                 day_name = calendar.day_name[tomorrow.weekday()].lower()[:3]
+                tomorrow_str = tomorrow.strftime('%Y-%m-%d')
+                
                 cursor.execute("""
                     SELECT * FROM reminders 
-                    WHERE chat_id=? AND is_active=1 AND (days LIKE ? OR days LIKE ?)
+                    WHERE chat_id=? AND is_active=1 AND reminder_type='recurring'
+                    AND (days LIKE ? OR days LIKE ?)
                     ORDER BY hour, minute
                 """, (chat_id, f'%{day_name}%', '%mon,tue,wed,thu,fri,sat,sun%'))
-                title = f"📆 Котик знайшов розклад на завтра ({tomorrow.strftime('%d.%m.%Y')})"
+                recurring = cursor.fetchall()
+                
+                cursor.execute("""
+                    SELECT * FROM reminders 
+                    WHERE chat_id=? AND is_active=1 AND reminder_type='one_time'
+                    AND specific_date=?
+                    ORDER BY hour, minute
+                """, (chat_id, tomorrow_str))
+                onetime = cursor.fetchall()
+                
+                title = f"📆 Розклад на завтра ({tomorrow.strftime('%d.%m.%Y')})"
                 
             elif period == 'week':
                 cursor.execute("""
                     SELECT * FROM reminders 
                     WHERE chat_id=? AND is_active=1
-                    ORDER BY hour, minute
+                    ORDER BY reminder_type, hour, minute
                 """, (chat_id,))
-                title = "🗓️ Котик знайшов розклад на тиждень"
+                all_reminders = cursor.fetchall()
+                recurring = [r for r in all_reminders if len(r) > 7 and r[7] == 'recurring']
+                onetime = [r for r in all_reminders if len(r) > 7 and r[7] == 'one_time']
+                title = "🗓️ Розклад на тиждень"
                 
             elif period == 'month':
                 cursor.execute("""
                     SELECT * FROM reminders 
                     WHERE chat_id=? AND is_active=1
-                    ORDER BY hour, minute
+                    ORDER BY reminder_type, hour, minute
                 """, (chat_id,))
-                title = "📊 Котик знайшов розклад на місяць"
+                all_reminders = cursor.fetchall()
+                recurring = [r for r in all_reminders if len(r) > 7 and r[7] == 'recurring']
+                onetime = [r for r in all_reminders if len(r) > 7 and r[7] == 'one_time']
+                title = "📊 Розклад на місяць"
             
-            reminders = cursor.fetchall()
             conn.close()
             
-            if not reminders:
-                text = f"{title}\n\n🐱 Мяу! Немає запланованих нагадувань.\nКотик може допомогти додати!"
+            if not recurring and not onetime:
+                text = f"{title}\n\n🐱 Немає запланованих нагадувань.\nКотик може допомогти додати!"
                 keyboard = {
                     'inline_keyboard': [
                         [{'text': '➕ Додати нагадування', 'callback_data': 'add_reminder'}],
@@ -953,10 +289,27 @@ def handle_callback_query(callback_query):
                 }
             else:
                 text = f"{title}\n\n"
-                for r in reminders:
-                    days_emoji = get_days_emoji(r[5])
-                    text += f"⏰ {r[3]:02d}:{r[4]:02d} - {r[2]}\n"
-                    text += f"📅 {r[5]} {days_emoji}\n\n"
+                
+                all_reminders = list(recurring) + list(onetime)
+                all_reminders.sort(key=lambda x: (x[3], x[4]))  # Сортуємо за часом
+                
+                for r in all_reminders:
+                    reminder_type = r[7] if len(r) > 7 else 'recurring'
+                    type_emoji = "🔁" if reminder_type == 'recurring' else "📌"
+                    
+                    text += f"{type_emoji} {r[3]:02d}:{r[4]:02d} - {r[2]}\n"
+                    
+                    if reminder_type == 'recurring' and r[5]:
+                        days_emoji = get_days_emoji(r[5])
+                        text += f"📅 {r[5]} {days_emoji}\n"
+                    elif reminder_type == 'one_time' and len(r) > 8 and r[8]:
+                        try:
+                            date_obj = datetime.strptime(r[8], '%Y-%m-%d')
+                            text += f"📅 {date_obj.strftime('%d.%m.%Y')}\n"
+                        except:
+                            pass
+                    
+                    text += "\n"
                 
                 keyboard = {
                     'inline_keyboard': [
@@ -980,32 +333,23 @@ def handle_callback_query(callback_query):
         elif data == 'add_photo_info':
             edit_message_text(chat_id, message_id, 
                              "📸 Котик готовий зберегти фото!\n\n"
-                             "🐱 Просто надішли мені фото розкладу, і котик попросить вибрати тип (день/тиждень/місяць).", 
+                             "🐱 Просто надішли мені фото розкладу, і котик попросить вибрати тип.", 
                              reply_markup=get_back_to_main_keyboard())
         
-        # Збереження фото з типом
-        elif data.startswith('save_photo_'):
-            parts = data.split('_')
-            if len(parts) >= 4:
-                schedule_type = parts[2]
-                file_id = '_'.join(parts[3:])
-                
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO schedule_photos (chat_id, photo_file_id, schedule_type, description)
-                    VALUES (?, ?, ?, ?)
-                """, (chat_id, file_id, schedule_type, f"Розклад ({schedule_type})"))
-                conn.commit()
-                conn.close()
+        # Вибір типу фото
+        elif data.startswith('photo_type_'):
+            photo_type = data.split('_')[2]
+            photo_file_id = get_user_data(user_id, 'photo_file_id')
+            
+            if photo_file_id:
+                set_user_data(user_id, 'photo_type', photo_type)
+                set_user_state(user_id, States.WAITING_FOR_PHOTO_TYPE)
                 
                 type_names = {'day': 'день', 'week': 'тиждень', 'month': 'місяць'}
-                
                 edit_message_text(chat_id, message_id,
-                    f"✅ Мяу! Котик зберіг фото розкладу на {type_names.get(schedule_type, schedule_type)}!\n\n"
-                    f"🐱 Можна переглянути у меню фото.",
-                    reply_markup=get_back_to_main_keyboard()
-                )
+                    f"📸 Тип фото: {type_names.get(photo_type, photo_type)}\n\n"
+                    f"📝 Введи опис для фото (наприклад: 'Розклад на понеділок'):",
+                    reply_markup=get_cancel_keyboard())
         
         answer_callback_query(callback_query['id'])
         
@@ -1020,18 +364,15 @@ def handle_callback_query(callback_query):
 def handle_photo(message):
     try:
         chat_id = message['chat']['id']
+        user_id = message['from']['id']
         photo = message['photo'][-1]  # Найбільше фото
         
-        keyboard = {
-            'inline_keyboard': [
-                [{'text': '📅 День', 'callback_data': f'save_photo_day_{photo["file_id"]}'},
-                 {'text': '🗓️ Тиждень', 'callback_data': f'save_photo_week_{photo["file_id"]}'}],
-                [{'text': '📊 Місяць', 'callback_data': f'save_photo_month_{photo["file_id"]}'}],
-                [{'text': '❌ Скасувати', 'callback_data': 'photos_menu'}]
-            ]
-        }
+        # Зберігаємо file_id фото
+        set_user_data(user_id, 'photo_file_id', photo['file_id'])
         
-        send_message(chat_id, "📸 Мяу! Котик отримав фото!\n\n🐱 Для якого періоду це розклад?", 
+        keyboard = get_photo_type_keyboard()
+        
+        send_message(chat_id, "📸 Котик отримав фото!\n\n🐱 Для якого періоду це розклад?", 
                     reply_markup=keyboard)
                     
     except Exception as e:
@@ -1045,7 +386,7 @@ def handle_delete_reminder(message):
         chat_id = message['chat']['id']
         args_text = message['text'].replace('/delete', '').strip()
         if not args_text:
-            send_message(chat_id, "🐱 Мяу! Котик не розуміє.\n\n❌ Вкажи ID нагадування: /delete 123", 
+            send_message(chat_id, "🐱 Котик не розуміє.\n\n❌ Вкажи ID нагадування: /delete 123", 
                         reply_markup=get_back_to_main_keyboard())
             return
         
@@ -1060,7 +401,7 @@ def handle_delete_reminder(message):
         conn.close()
         
         if deleted_count > 0:
-            send_message(chat_id, f"✅ Мяу! Котик видалив нагадування {reminder_id}.", 
+            send_message(chat_id, f"✅ Котик видалив нагадування {reminder_id}.", 
                         reply_markup=get_back_to_main_keyboard())
         else:
             send_message(chat_id, "❌ Котик не знайшов таке нагадування.", 
@@ -1079,7 +420,7 @@ def handle_delete_birthday(message):
         chat_id = message['chat']['id']
         args_text = message['text'].replace('/delete_birthday', '').strip()
         if not args_text:
-            send_message(chat_id, "🐱 Мяу! Котик не розуміє.\n\n❌ Вкажи ID дня народження: /delete_birthday 123", 
+            send_message(chat_id, "🐱 Котик не розуміє.\n\n❌ Вкажи ID дня народження: /delete_birthday 123", 
                         reply_markup=get_back_to_main_keyboard())
             return
         
@@ -1094,7 +435,7 @@ def handle_delete_birthday(message):
         conn.close()
         
         if deleted_count > 0:
-            send_message(chat_id, f"✅ Мяу! Котик видалив день народження {birthday_id}.", 
+            send_message(chat_id, f"✅ Котик видалив день народження {birthday_id}.", 
                         reply_markup=get_back_to_main_keyboard())
         else:
             send_message(chat_id, "❌ Котик не знайшов такий день народження.", 
@@ -1140,12 +481,13 @@ def handle_message(message):
             else:
                 # Невідома команда
                 send_message(chat_id, 
-                    "🐱 Мяу! Котик не розуміє цю команду.\n\n"
+                    "🐱 Котик не розуміє цю команду.\n\n"
                     "Спробуй головне меню або надішли /help для допомоги!\n\n"
                     "**Або спитай природною мовою:**\n"
                     "• \"котику, що у мене сьогодні?\"\n"
                     "• \"покажи розклад на завтра\"\n"
-                    "• \"які справи на 15.03?\"",
+                    "• \"які справи на 15.03?\"\n"
+                    "• \"додай нагадування завтра о 15:00\"",
                     reply_markup=get_main_menu_keyboard(),
                     parse_mode='Markdown'
                 )
@@ -1193,7 +535,7 @@ def run_bot():
             updates = get_updates(offset)
             
             if updates and updates.get('ok'):
-                consecutive_errors = 0  # Скидаємо лічильник помилок
+                consecutive_errors = 0
                 
                 for update in updates['result']:
                     try:
@@ -1222,7 +564,7 @@ def run_bot():
                     time.sleep(10)
                     consecutive_errors = 0
             
-            time.sleep(0.1)  # Невелика затримка
+            time.sleep(0.1)
             
         except KeyboardInterrupt:
             logger.info("🐱 Котик йде спати...")
@@ -1235,7 +577,7 @@ def run_bot():
         except Exception as e:
             logger.error(f"❌ Котик спіткнувся: {e}")
             consecutive_errors += 1
-            sleep_time = min(5 * consecutive_errors, 60)  # Поступово збільшуємо затримку
+            sleep_time = min(5 * consecutive_errors, 60)
             time.sleep(sleep_time)
 
 if __name__ == "__main__":
@@ -1243,3 +585,636 @@ if __name__ == "__main__":
         run_bot()
     except Exception as e:
         logger.error(f"❌ Котик сильно спіткнувся: {e}")
+stop_reminders = False
+
+# Стани FSM
+class States:
+    WAITING_FOR_TEXT = "waiting_for_text"
+    WAITING_FOR_TIME = "waiting_for_time"
+    WAITING_FOR_DAYS = "waiting_for_days"
+    WAITING_FOR_SPECIFIC_DAYS = "waiting_for_specific_days"
+    WAITING_FOR_BIRTHDAY_NAME = "waiting_for_birthday_name"
+    WAITING_FOR_BIRTHDAY_DATE = "waiting_for_birthday_date"
+    WAITING_FOR_PHOTO_TYPE = "waiting_for_photo_type"
+    WAITING_FOR_REMINDER_TYPE = "waiting_for_reminder_type"
+
+# --- База даних ---
+def init_db():
+    try:
+        conn = sqlite3.connect("reminders.db")
+        cursor = conn.cursor()
+        
+        # Таблиця нагадувань
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            text TEXT,
+            hour INTEGER,
+            minute INTEGER,
+            days TEXT,
+            one_time INTEGER,
+            reminder_type TEXT DEFAULT 'recurring',
+            specific_date TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_active INTEGER DEFAULT 1
+        )
+        """)
+        
+        # Таблиця фото розкладу
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS schedule_photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            photo_file_id TEXT,
+            schedule_type TEXT,
+            description TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        
+        # Таблиця днів народження
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS birthdays (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            name TEXT,
+            birth_date TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        
+        conn.commit()
+        conn.close()
+        logger.info("✅ База даних ініціалізована")
+    except Exception as e:
+        logger.error(f"❌ Помилка ініціалізації БД: {e}")
+
+def get_db_connection():
+    return sqlite3.connect("reminders.db")
+
+# --- Розширена ШІ обробка природної мови ---
+class AIMessageProcessor:
+    """Клас для обробки повідомлень природною мовою"""
+    
+    def __init__(self):
+        self.date_patterns = [
+            r'(\d{1,2})\.(\d{1,2})\.?(\d{0,4})?',  # 01.01 або 01.01.2024
+            r'(\d{1,2})/(\d{1,2})/(\d{2,4})',      # 01/01/24
+            r'(\d{1,2})-(\d{1,2})-?(\d{0,4})?',    # 01-01 або 01-01-2024
+        ]
+        
+        self.time_patterns = [
+            r'(\d{1,2}):(\d{2})',                   # 14:30
+            r'(\d{1,2})\.(\d{2})',                  # 14.30
+            r'о?(\d{1,2}) год(?:ин[иа])?',          # 14 год, о 14 годині
+            r'в (\d{1,2}):(\d{2})',                 # в 14:30
+        ]
+        
+        # Розширені ключові слова для розпізнавання
+        self.schedule_keywords = [
+            'розклад', 'schedule', 'заплановано', 'план', 'що у мене', 'що в мене',
+            'нагадування', 'справи', 'діла', 'завдання', 'подія', 'події', 'зустріч'
+        ]
+        
+        self.add_keywords = [
+            'додай', 'добавь', 'створи', 'нагадай', 'запланій', 'зробити',
+            'треба', 'потрібно', 'не забути', 'важливо'
+        ]
+        
+        self.birthday_keywords = [
+            'день народження', 'др', 'birthday', 'народився', 'народилася'
+        ]
+        
+        self.today_keywords = [
+            'сьогодні', 'today', 'на сьогодні', 'цього дня', 'зараз'
+        ]
+        
+        self.tomorrow_keywords = [
+            'завтра', 'tomorrow', 'на завтра'
+        ]
+        
+        self.week_days = {
+            'понеділок': 'mon', 'monday': 'mon', 'пн': 'mon',
+            'вівторок': 'tue', 'tuesday': 'tue', 'вт': 'tue',
+            'середа': 'wed', 'wednesday': 'wed', 'ср': 'wed',
+            'четвер': 'thu', 'thursday': 'thu', 'чт': 'thu',
+            'п\'ятниця': 'fri', 'friday': 'fri', 'пт': 'fri',
+            'субота': 'sat', 'saturday': 'sat', 'сб': 'sat',
+            'неділя': 'sun', 'sunday': 'sun', 'нд': 'sun'
+        }
+        
+        # Фрази для видалення
+        self.delete_keywords = [
+            'видали', 'удали', 'delete', 'прибери', 'скасуй'
+        ]
+    
+    def extract_date(self, text):
+        """Витягує дату з тексту"""
+        for pattern in self.date_patterns:
+            match = re.search(pattern, text)
+            if match:
+                day, month = int(match.group(1)), int(match.group(2))
+                year = None
+                if match.group(3) and len(match.group(3)) > 0:
+                    year_str = match.group(3)
+                    if len(year_str) == 2:
+                        year = 2000 + int(year_str)
+                    else:
+                        year = int(year_str)
+                
+                try:
+                    if year:
+                        return datetime(year, month, day)
+                    else:
+                        current_year = datetime.now().year
+                        date = datetime(current_year, month, day)
+                        if date < datetime.now().replace(hour=0, minute=0, second=0, microsecond=0):
+                            date = datetime(current_year + 1, month, day)
+                        return date
+                except ValueError:
+                    continue
+        return None
+    
+    def extract_time(self, text):
+        """Витягує час з тексту"""
+        for pattern in self.time_patterns:
+            match = re.search(pattern, text)
+            if match:
+                if len(match.groups()) == 2:
+                    hour = int(match.group(1))
+                    minute = int(match.group(2))
+                else:
+                    hour = int(match.group(1))
+                    minute = 0
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    return hour, minute
+        return None
+    
+    def extract_weekday(self, text):
+        """Витягує день тижня з тексту"""
+        text_lower = text.lower()
+        for day_name, day_code in self.week_days.items():
+            if day_name in text_lower:
+                return day_code
+        return None
+    
+    def is_schedule_request(self, text):
+        """Перевіряє, чи є це запит на розклад"""
+        text_lower = text.lower()
+        return any(keyword in text_lower for keyword in self.schedule_keywords)
+    
+    def is_add_request(self, text):
+        """Перевіряє, чи є це запит на додавання"""
+        text_lower = text.lower()
+        return any(keyword in text_lower for keyword in self.add_keywords)
+    
+    def is_birthday_request(self, text):
+        """Перевіряє, чи є це запит про день народження"""
+        text_lower = text.lower()
+        return any(keyword in text_lower for keyword in self.birthday_keywords)
+    
+    def is_delete_request(self, text):
+        """Перевіряє, чи є це запит на видалення"""
+        text_lower = text.lower()
+        return any(keyword in text_lower for keyword in self.delete_keywords)
+    
+    def get_date_context(self, text):
+        """Визначає контекст дати"""
+        text_lower = text.lower()
+        
+        if any(keyword in text_lower for keyword in self.today_keywords):
+            return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        if any(keyword in text_lower for keyword in self.tomorrow_keywords):
+            return (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Перевіряємо день тижня
+        weekday = self.extract_weekday(text)
+        if weekday:
+            return self.get_next_weekday_date(weekday)
+        
+        return self.extract_date(text)
+    
+    def get_next_weekday_date(self, target_day):
+        """Отримує дату наступного вказаного дня тижня"""
+        days_order = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+        current_day = datetime.now().weekday()
+        target_index = days_order.index(target_day)
+        
+        days_ahead = (target_index - current_day) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+            
+        return datetime.now() + timedelta(days=days_ahead)
+    
+    def process_natural_message(self, text, chat_id):
+        """Основна функція обробки природного повідомлення"""
+        # Перевіряємо різні типи запитів
+        if self.is_delete_request(text):
+            return self.handle_delete_request(text, chat_id)
+        
+        if self.is_add_request(text):
+            return self.handle_add_request(text, chat_id)
+        
+        if self.is_birthday_request(text):
+            return self.handle_birthday_request(text, chat_id)
+        
+        if self.is_schedule_request(text):
+            target_date = self.get_date_context(text)
+            if target_date:
+                return self.get_schedule_for_date(chat_id, target_date)
+            else:
+                return self.get_general_schedule(chat_id)
+        
+        return None
+    
+    def handle_add_request(self, text, chat_id):
+        """Обробляє запити на додавання"""
+        time_info = self.extract_time(text)
+        date_info = self.get_date_context(text)
+        
+        if time_info and date_info:
+            # Можемо створити нагадування автоматично
+            reminder_text = self.extract_reminder_text(text)
+            if reminder_text:
+                try:
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    
+                    hour, minute = time_info
+                    date_str = date_info.strftime('%Y-%m-%d')
+                    
+                    cursor.execute("""
+                        INSERT INTO reminders (chat_id, text, hour, minute, days, one_time, reminder_type, specific_date)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (chat_id, reminder_text, hour, minute, '', 1, 'one_time', date_str))
+                    
+                    conn.commit()
+                    conn.close()
+                    
+                    return (f"✅ Котик додав нагадування!\n\n"
+                           f"📝 {reminder_text}\n"
+                           f"⏰ {hour:02d}:{minute:02d}\n"
+                           f"📅 {date_info.strftime('%d.%m.%Y')}")
+                
+                except Exception as e:
+                    logger.error(f"Помилка створення нагадування: {e}")
+                    return "❌ Котик спіткнувся при створенні нагадування."
+        
+        return "🐱 Котик розуміє, що треба щось додати, але потрібно більше деталей. Спробуй через меню!"
+    
+    def extract_reminder_text(self, text):
+        """Витягує текст нагадування з повідомлення"""
+        # Видаляємо ключові слова
+        clean_text = text
+        for keyword in self.add_keywords:
+            clean_text = re.sub(r'\b' + keyword + r'\b', '', clean_text, flags=re.IGNORECASE)
+        
+        # Видаляємо час та дату
+        for pattern in self.time_patterns + self.date_patterns:
+            clean_text = re.sub(pattern, '', clean_text)
+        
+        # Видаляємо дні тижня
+        for day_name in self.week_days.keys():
+            clean_text = re.sub(r'\b' + day_name + r'\b', '', clean_text, flags=re.IGNORECASE)
+        
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+        
+        return clean_text if len(clean_text) > 3 else None
+    
+    def handle_birthday_request(self, text, chat_id):
+        """Обробляє запити про дні народження"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM birthdays WHERE chat_id=? ORDER BY name", (chat_id,))
+        birthdays = cursor.fetchall()
+        conn.close()
+        
+        if not birthdays:
+            return "🎂 У котика немає збережених днів народження. Додати через меню?"
+        
+        response = "🎂 **Дні народження:**\n\n"
+        for b in birthdays:
+            birthday_id, _, name, birth_date = b[:4]
+            month, day = map(int, birth_date.split('-'))
+            response += f"🔹 {name} - {day:02d}.{month:02d}\n"
+        
+        return response
+    
+    def handle_delete_request(self, text, chat_id):
+        """Обробляє запити на видалення"""
+        return "🗑️ Для видалення використовуй команди:\n/delete [ID] - видалити нагадування\n/delete_birthday [ID] - видалити день народження"
+    
+    def get_schedule_for_date(self, chat_id, target_date):
+        """Отримує розклад на конкретну дату"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            day_name = calendar.day_name[target_date.weekday()].lower()[:3]
+            date_str = target_date.strftime('%Y-%m-%d')
+            
+            # Отримуємо регулярні нагадування на цей день
+            cursor.execute("""
+                SELECT * FROM reminders 
+                WHERE chat_id=? AND is_active=1 AND reminder_type='recurring'
+                AND (days LIKE ? OR days LIKE ?)
+                ORDER BY hour, minute
+            """, (chat_id, f'%{day_name}%', '%mon,tue,wed,thu,fri,sat,sun%'))
+            
+            recurring_reminders = cursor.fetchall()
+            
+            # Отримуємо одноразові нагадування на цю дату
+            cursor.execute("""
+                SELECT * FROM reminders 
+                WHERE chat_id=? AND is_active=1 AND reminder_type='one_time'
+                AND specific_date=?
+                ORDER BY hour, minute
+            """, (chat_id, date_str))
+            
+            one_time_reminders = cursor.fetchall()
+            
+            # Отримуємо дні народження на цю дату
+            date_format = f"{target_date.month:02d}-{target_date.day:02d}"
+            cursor.execute("""
+                SELECT * FROM birthdays 
+                WHERE chat_id=? AND birth_date=?
+            """, (chat_id, date_format))
+            
+            birthdays = cursor.fetchall()
+            conn.close()
+            
+            # Формуємо відповідь
+            date_formatted = target_date.strftime('%d.%m.%Y')
+            day_name_uk = self.get_day_name_ukrainian(target_date.weekday())
+            
+            response = f"📅 Розклад на {date_formatted} ({day_name_uk}):\n\n"
+            
+            all_reminders = list(recurring_reminders) + list(one_time_reminders)
+            all_reminders.sort(key=lambda x: (x[3], x[4]))  # Сортуємо за часом
+            
+            if all_reminders:
+                response += "⏰ **Нагадування:**\n"
+                for r in all_reminders:
+                    type_icon = "🔁" if len(r) > 7 and r[7] == 'recurring' else "📌"
+                    response += f"{type_icon} {r[3]:02d}:{r[4]:02d} - {r[2]}\n"
+                response += "\n"
+            
+            if birthdays:
+                response += "🎂 **Дні народження:**\n"
+                for b in birthdays:
+                    response += f"🎉 {b[2]}\n"
+                response += "\n"
+            
+            if not all_reminders and not birthdays:
+                response += "🐱 На цей день немає запланованих подій.\nКотик може допомогти додати щось нове!"
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Помилка отримання розкладу: {e}")
+            return "❌ Котик спіткнувся при пошуку розкладу."
+    
+    def get_general_schedule(self, chat_id):
+        """Отримує загальний розклад"""
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT * FROM reminders 
+                WHERE chat_id=? AND is_active=1
+                ORDER BY reminder_type, hour, minute
+                LIMIT 15
+            """, (chat_id,))
+            
+            reminders = cursor.fetchall()
+            conn.close()
+            
+            if not reminders:
+                return "🐱 У котика немає активних нагадувань.\nМожна додати через меню!"
+            
+            response = "📋 **Твої нагадування:**\n\n"
+            
+            recurring = [r for r in reminders if len(r) > 7 and r[7] == 'recurring']
+            one_time = [r for r in reminders if len(r) > 7 and r[7] == 'one_time']
+            
+            if recurring:
+                response += "🔁 **Регулярні:**\n"
+                for r in recurring:
+                    days_emoji = get_days_emoji(r[5])
+                    response += f"⏰ {r[3]:02d}:{r[4]:02d} - {r[2]}\n"
+                    if r[5]:
+                        response += f"📅 {r[5]} {days_emoji}\n"
+                    response += "\n"
+            
+            if one_time:
+                response += "📌 **Одноразові:**\n"
+                for r in one_time:
+                    specific_date = ""
+                    if len(r) > 8 and r[8]:
+                        try:
+                            date_obj = datetime.strptime(r[8], '%Y-%m-%d')
+                            specific_date = f" ({date_obj.strftime('%d.%m.%Y')})"
+                        except:
+                            pass
+                    response += f"⏰ {r[3]:02d}:{r[4]:02d} - {r[2]}{specific_date}\n\n"
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Помилка отримання загального розкладу: {e}")
+            return "❌ Котик спіткнувся при пошуку розкладу."
+    
+    def get_day_name_ukrainian(self, weekday):
+        """Повертає назву дня тижня українською"""
+        days = ['понеділок', 'вівторок', 'середа', 'четвер', "п'ятниця", 'субота', 'неділя']
+        return days[weekday]
+
+# Ініціалізуємо AI процесор
+ai_processor = AIMessageProcessor()
+
+# --- Telegram API функції ---
+def send_message(chat_id, text, reply_markup=None, parse_mode=None):
+    """Надсилання повідомлення"""
+    try:
+        if len(text) > 4096:
+            text = text[:4093] + "..."
+        
+        data = {
+            'chat_id': chat_id,
+            'text': text
+        }
+        if reply_markup:
+            data['reply_markup'] = json.dumps(reply_markup)
+        if parse_mode:
+            data['parse_mode'] = parse_mode
+            
+        response = requests.post(f"{BASE_URL}/sendMessage", data=data, timeout=10)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Помилка надсилання повідомлення: {e}")
+        return None
+
+def send_photo(chat_id, photo_file_id, caption=None, reply_markup=None):
+    """Надсилання фото"""
+    try:
+        data = {
+            'chat_id': chat_id,
+            'photo': photo_file_id
+        }
+        if caption:
+            data['caption'] = caption[:1024]
+        if reply_markup:
+            data['reply_markup'] = json.dumps(reply_markup)
+            
+        response = requests.post(f"{BASE_URL}/sendPhoto", data=data, timeout=10)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Помилка надсилання фото: {e}")
+        return None
+
+def edit_message_text(chat_id, message_id, text, reply_markup=None, parse_mode=None):
+    """Редагування повідомлення"""
+    try:
+        if len(text) > 4096:
+            text = text[:4093] + "..."
+            
+        data = {
+            'chat_id': chat_id,
+            'message_id': message_id,
+            'text': text
+        }
+        if reply_markup:
+            data['reply_markup'] = json.dumps(reply_markup)
+        if parse_mode:
+            data['parse_mode'] = parse_mode
+            
+        response = requests.post(f"{BASE_URL}/editMessageText", data=data, timeout=10)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Помилка редагування повідомлення: {e}")
+        return None
+
+def answer_callback_query(callback_query_id, text=None):
+    """Відповідь на callback query"""
+    try:
+        data = {'callback_query_id': callback_query_id}
+        if text:
+            data['text'] = text
+        response = requests.post(f"{BASE_URL}/answerCallbackQuery", data=data, timeout=10)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Помилка відповіді на callback: {e}")
+        return None
+
+# --- Клавіатури з кнопками ---
+def get_main_menu_keyboard():
+    return {
+        'inline_keyboard': [
+            [{'text': '➕ Додати нагадування', 'callback_data': 'add_reminder'}],
+            [{'text': '📝 Мої нагадування', 'callback_data': 'list_reminders'}],
+            [{'text': '🎂 Дні народження', 'callback_data': 'birthdays_menu'}],
+            [{'text': '📅 Розклад', 'callback_data': 'schedule_menu'}],
+            [{'text': '📸 Фото розкладу', 'callback_data': 'photos_menu'}],
+            [{'text': 'ℹ️ Допомога', 'callback_data': 'help'}]
+        ]
+    }
+
+def get_reminder_type_keyboard():
+    return {
+        'inline_keyboard': [
+            [{'text': '🔁 Регулярне нагадування', 'callback_data': 'reminder_type_recurring'}],
+            [{'text': '📌 Одноразове нагадування', 'callback_data': 'reminder_type_onetime'}],
+            [{'text': '❌ Скасувати', 'callback_data': 'main_menu'}]
+        ]
+    }
+
+def get_schedule_keyboard():
+    return {
+        'inline_keyboard': [
+            [{'text': '📅 Сьогодні', 'callback_data': 'schedule_today'},
+             {'text': '📆 Завтра', 'callback_data': 'schedule_tomorrow'}],
+            [{'text': '🗓️ Цей тиждень', 'callback_data': 'schedule_week'},
+             {'text': '📊 Цей місяць', 'callback_data': 'schedule_month'}],
+            [{'text': '🔙 Назад', 'callback_data': 'main_menu'}]
+        ]
+    }
+
+def get_days_keyboard():
+    return {
+        'inline_keyboard': [
+            [{'text': 'Будні', 'callback_data': 'days_weekdays'},
+             {'text': 'Вихідні', 'callback_data': 'days_weekend'}],
+            [{'text': 'Щодня', 'callback_data': 'days_daily'}],
+            [{'text': 'Вибіркові дні', 'callback_data': 'days_custom'}],
+            [{'text': '❌ Скасувати', 'callback_data': 'main_menu'}]
+        ]
+    }
+
+def get_weekdays_keyboard():
+    return {
+        'inline_keyboard': [
+            [{'text': 'Пн', 'callback_data': 'day_mon'}, 
+             {'text': 'Вт', 'callback_data': 'day_tue'}, 
+             {'text': 'Ср', 'callback_data': 'day_wed'}],
+            [{'text': 'Чт', 'callback_data': 'day_thu'}, 
+             {'text': 'Пт', 'callback_data': 'day_fri'}, 
+             {'text': 'Сб', 'callback_data': 'day_sat'}],
+            [{'text': 'Нд', 'callback_data': 'day_sun'}],
+            [{'text': '✅ Готово', 'callback_data': 'days_selected'}, 
+             {'text': '❌ Скасувати', 'callback_data': 'main_menu'}]
+        ]
+    }
+
+def get_birthday_keyboard():
+    return {
+        'inline_keyboard': [
+            [{'text': '➕ Додати день народження', 'callback_data': 'add_birthday'}],
+            [{'text': '📝 Мої дні народження', 'callback_data': 'list_birthdays'}],
+            [{'text': '🔙 Назад', 'callback_data': 'main_menu'}]
+        ]
+    }
+
+def get_photos_keyboard():
+    return {
+        'inline_keyboard': [
+            [{'text': '📋 Переглянути фото', 'callback_data': 'view_photos'}],
+            [{'text': '➕ Додати фото', 'callback_data': 'add_photo_info'}],
+            [{'text': '🔙 Назад', 'callback_data': 'main_menu'}]
+        ]
+    }
+
+def get_photo_type_keyboard():
+    return {
+        'inline_keyboard': [
+            [{'text': '📅 День', 'callback_data': 'photo_type_day'},
+             {'text': '🗓️ Тиждень', 'callback_data': 'photo_type_week'}],
+            [{'text': '📊 Місяць', 'callback_data': 'photo_type_month'}],
+            [{'text': '❌ Скасувати', 'callback_data': 'photos_menu'}]
+        ]
+    }
+
+def get_cancel_keyboard():
+    return {
+        'inline_keyboard': [
+            [{'text': '❌ Скасувати', 'callback_data': 'main_menu'}]
+        ]
+    }
+
+def get_back_to_main_keyboard():
+    return {
+        'inline_keyboard': [
+            [{'text': '🔙 Головне меню', 'callback_data': 'main_menu'}]
+        ]
+    }
+
+# --- Допоміжні функції ---
+def get_days_emoji(days_str):
+    days_map = {
+        'mon': '🟢', 'tue': '🟡', 'wed': '🔵', 'thu': '🟠', 
+        'fri': '🔴', 'sat': '🟣', 'sun': '⚪'
+    }
+    if not days_str:
+        return ""
